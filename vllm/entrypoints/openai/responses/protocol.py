@@ -65,6 +65,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
+    RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
@@ -262,6 +263,10 @@ class ResponsesRequest(OpenAIBaseModel):
     )
 
     repetition_penalty: float | None = None
+    repetition_detection: RepetitionDetectionParams | None = Field(
+        default=None,
+        description="Parameters for detecting repetitive N-gram patterns in output.",
+    )
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: str | list[str] | None = []
     ignore_eos: bool = False
@@ -411,6 +416,11 @@ class ResponsesRequest(OpenAIBaseModel):
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
+            repetition_detection=(
+                self.repetition_detection
+                if self.repetition_detection is not None
+                else default_sampling_params.get("repetition_detection")
+            ),
             seed=self.seed,
             ignore_eos=self.ignore_eos,
             output_kind=(

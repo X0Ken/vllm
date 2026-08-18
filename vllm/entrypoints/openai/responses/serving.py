@@ -100,7 +100,11 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.sampling_params import (
+    RepetitionDetectionParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
@@ -166,6 +170,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        default_repetition_detection_config: RepetitionDetectionParams | None = None,
     ) -> None:
         super().__init__(
             engine_client=engine_client,
@@ -193,6 +198,10 @@ class OpenAIServingResponses(GenerateBaseServing):
         self.enable_force_include_usage = enable_force_include_usage
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        if default_repetition_detection_config is not None:
+            self.default_sampling_params["repetition_detection"] = (
+                default_repetition_detection_config
+            )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
