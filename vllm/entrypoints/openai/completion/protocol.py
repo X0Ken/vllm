@@ -371,7 +371,11 @@ class CompletionRequest(OpenAIBaseModel):
             bad_words=self.bad_words,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
-            repetition_detection=self.repetition_detection,
+            repetition_detection=(
+                self.repetition_detection
+                if self.repetition_detection is not None
+                else default_sampling_params.get("repetition_detection")
+            ),
             thinking_token_budget=self.thinking_token_budget,
         )
 
