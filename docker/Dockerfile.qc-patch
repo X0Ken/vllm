@@ -1,9 +1,9 @@
-ARG BASE_IMAGE=hub.kubesphere.com.cn/ai-public/vllm/vllm-openai:v0.26.0
+ARG BASE_IMAGE=vllm/vllm-openai:v0.26.0
 FROM ${BASE_IMAGE}
 
 ARG QC_PATCH_COMMIT=unknown
 LABEL org.opencontainers.image.title="vLLM OpenAI qc-patch"
-LABEL org.opencontainers.image.base.name="hub.kubesphere.com.cn/ai-public/vllm/vllm-openai:v0.26.0"
+LABEL org.opencontainers.image.base.name="vllm/vllm-openai:v0.26.0"
 LABEL org.opencontainers.image.revision="${QC_PATCH_COMMIT}"
 
 # The base image already contains the v0.26.0 wheel and compiled CUDA
