@@ -730,7 +730,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
-            repetition_detection=self.repetition_detection,
+            repetition_detection=(
+                self.repetition_detection
+                if self.repetition_detection is not None
+                else default_sampling_params.get("repetition_detection")
+            ),
         )
 
     @model_validator(mode="before")

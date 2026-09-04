@@ -44,7 +44,11 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import (
+    BeamSearchParams,
+    RepetitionDetectionParams,
+    SamplingParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
@@ -64,6 +68,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_per_request_metrics: bool = False,
+        default_repetition_detection_config: RepetitionDetectionParams | None = None,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -78,6 +83,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
         self.enable_per_request_metrics = enable_per_request_metrics
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        if default_repetition_detection_config is not None:
+            self.default_sampling_params["repetition_detection"] = (
+                default_repetition_detection_config
+            )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")

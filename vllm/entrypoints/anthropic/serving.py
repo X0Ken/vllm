@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.utils.api_utils import sanitize_message
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.sampling_params import RepetitionDetectionParams
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class AnthropicServingMessages(OpenAIServingChat):
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
+        default_repetition_detection_config: RepetitionDetectionParams | None = None,
     ):
         super().__init__(
             engine_client=engine_client,
@@ -132,6 +134,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             enable_prompt_tokens_details=enable_prompt_tokens_details,
             enable_force_include_usage=enable_force_include_usage,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            default_repetition_detection_config=(default_repetition_detection_config),
         )
         self.stop_reason_map = {
             "stop": "end_turn",
@@ -487,6 +490,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,
             cache_salt=anthropic_request.cache_salt,
+            repetition_detection=anthropic_request.repetition_detection,
             kv_transfer_params=anthropic_request.kv_transfer_params,
             ec_transfer_params=anthropic_request.ec_transfer_params,
             chat_template_kwargs=anthropic_request.chat_template_kwargs,

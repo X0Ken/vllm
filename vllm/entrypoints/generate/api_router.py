@@ -145,6 +145,9 @@ async def init_generate_state(
             enable_force_include_usage=args.enable_force_include_usage,
             enable_log_outputs=args.enable_log_outputs,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            default_repetition_detection_config=(
+                args.default_repetition_detection_config
+            ),
         )
         if "generate" in supported_tasks
         else None
@@ -169,6 +172,7 @@ async def init_generate_state(
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
         enable_per_request_metrics=args.enable_per_request_metrics,
+        default_repetition_detection_config=(args.default_repetition_detection_config),
     )
     state.openai_serving_chat = (
         OpenAIServingChat(**_chat_kwargs) if "generate" in supported_tasks else None
@@ -188,6 +192,9 @@ async def init_generate_state(
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
             enable_per_request_metrics=args.enable_per_request_metrics,
+            default_repetition_detection_config=(
+                args.default_repetition_detection_config
+            ),
         )
         if "generate" in supported_tasks
         else None
@@ -208,6 +215,9 @@ async def init_generate_state(
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
             default_chat_template_kwargs=default_chat_template_kwargs,
+            default_repetition_detection_config=(
+                args.default_repetition_detection_config
+            ),
         )
         if "generate" in supported_tasks
         else None

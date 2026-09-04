@@ -25,8 +25,21 @@ from vllm.entrypoints.serve.utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
+from vllm.sampling_params import RepetitionDetectionParams
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+
+def _parse_repetition_detection_config(value: str) -> RepetitionDetectionParams:
+    try:
+        config = json.loads(value)
+        if not isinstance(config, dict):
+            raise TypeError("expected a JSON object")
+        return RepetitionDetectionParams(**config)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid repetition detection config: {exc}"
+        ) from exc
 
 
 class LoRAParserAction(argparse.Action):
@@ -96,6 +109,10 @@ class BaseFrontendArgs:
     with request values taking precedence. Useful for setting default
     behavior for reasoning models. Example: '{"enable_thinking": false}'
     to disable thinking mode by default for Qwen3/DeepSeek models."""
+    default_repetition_detection_config: RepetitionDetectionParams | None = None
+    """Default repetition detection parameters for generation requests. Request-level
+    values take precedence. Example: '{"min_pattern_size":2,
+    "max_pattern_size":64,"min_count":4}'."""
     response_role: str = "assistant"
     """The role name to return if `request.add_generation_prompt=true`."""
     return_tokens_as_token_ids: bool = False
@@ -199,6 +216,9 @@ class BaseFrontendArgs:
         """
         # Special case: default_chat_template_kwargs needs json.loads type
         frontend_kwargs["default_chat_template_kwargs"]["type"] = json.loads
+        frontend_kwargs["default_repetition_detection_config"]["type"] = (
+            _parse_repetition_detection_config
+        )
 
         # Special case: LoRA modules need custom parser action and
         # optional_type(str)
