@@ -7,6 +7,7 @@ import pytest
 
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+from vllm.sampling_params import RepetitionDetectionParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from ...utils import VLLM_PATH
@@ -261,6 +262,32 @@ def test_default_chat_template_kwargs_invalid_json(serve_parser):
         serve_parser.parse_args(
             args=["--default-chat-template-kwargs", "not valid json"]
         )
+
+
+def test_default_repetition_detection_config_parsing(serve_parser):
+    args = serve_parser.parse_args(
+        args=[
+            "--default-repetition-detection-config",
+            '{"min_pattern_size":2,"max_pattern_size":64,"min_count":4}',
+        ]
+    )
+
+    assert args.default_repetition_detection_config == RepetitionDetectionParams(
+        min_pattern_size=2,
+        max_pattern_size=64,
+        min_count=4,
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not json", "[]", '{"max_pattern_size":1,"min_count":1}'],
+)
+def test_default_repetition_detection_config_rejects_invalid_values(
+    serve_parser, value
+):
+    with pytest.raises(SystemExit):
+        serve_parser.parse_args(args=["--default-repetition-detection-config", value])
 
 
 @pytest.mark.parametrize(
