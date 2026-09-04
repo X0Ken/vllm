@@ -101,15 +101,18 @@ class SimpleCPUOffloadScheduler:
                 self.fa_gidx = g_idx
                 break
         assert 0 <= self.fa_gidx < len(self.cpu_kv_cache_config.kv_cache_groups)
-        # FA group's own block_size; divides scheduler_block_size (the LCM)
-        # but is NOT assumed to equal it.
-        self.fa_block_size: int = (
-            self.cpu_kv_cache_config.kv_cache_groups[
-                self.fa_gidx
-            ].kv_cache_spec.block_size
-            * self.cp_world_size
+        # Number of model tokens represented by one physical block in the
+        # reference full-attention group.  DeepSeek-V4 compressed MLA stores
+        # ``compress_ratio`` model tokens per cache token, so its logical block
+        # size is larger than ``kv_cache_spec.block_size``.
+        self.fa_block_size: int = self._get_group_token_block_size(
+            self.cpu_kv_cache_config.kv_cache_groups[self.fa_gidx].kv_cache_spec
         )
-        assert self.block_size % self.fa_block_size == 0
+        # Depending on the model, the scheduler block can be either the finer
+        # or coarser granularity.  They still need to be commensurate.
+        larger = max(self.block_size, self.fa_block_size)
+        smaller = min(self.block_size, self.fa_block_size)
+        assert larger % smaller == 0
 
         logger.info(
             "SimpleCPUOffloadScheduler: Allocating %d CPU blocks (%.2f GB, mode=%s)",
@@ -216,6 +219,30 @@ class SimpleCPUOffloadScheduler:
             kv_cache_tensors=cpu_tensors,
             kv_cache_groups=gpu_config.kv_cache_groups,
         )
+
+    def _get_group_token_block_size(self, kv_cache_spec: Any) -> int:
+        """Return model tokens represented by one physical KV cache block.
+
+        Most cache specs store one cache entry per model token.  DeepSeek-V4's
+        compressed MLA cache is different: ``compress_ratio`` model tokens are
+        represented by one cache token.  The Ascend manager applies this ratio
+        when allocating physical blocks; SimpleCPUOffload must use the same
+        mapping when pairing CPU and device blocks for a reload.
+
+        Keep the special case scoped to DeepSeek-V4.  Other compressed-cache
+        layouts need their own end-to-end validation before opting in.
+        """
+        block_size = kv_cache_spec.block_size * self.cp_world_size
+        if getattr(kv_cache_spec, "model_version", None) != "deepseek_v4":
+            return block_size
+
+        compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+        if not isinstance(compress_ratio, int) or compress_ratio < 1:
+            raise ValueError(
+                "DeepSeek-V4 KV cache compress_ratio must be a positive "
+                f"integer, got {compress_ratio!r}"
+            )
+        return block_size * compress_ratio
 
     @staticmethod
     def _estimate_lazy_target_blocks(
@@ -344,6 +371,27 @@ class SimpleCPUOffloadScheduler:
         total_computed_tokens = num_computed_tokens + num_external_tokens
         kv_cache_groups = self.cpu_kv_cache_config.kv_cache_groups
 
+        logger.debug(
+            "SimpleCPUOffloadScheduler load mapping: req_id=%s "
+            "num_groups=%d scheduler_block_size=%d hash_block_size=%d "
+            "fa_gidx=%d fa_block_size=%d num_cached_fa_blocks=%d "
+            "num_computed_tokens=%d num_external_tokens=%d "
+            "total_computed_tokens=%d gpu_group_lengths=%s "
+            "cpu_hit_group_lengths=%s",
+            req_id,
+            num_groups,
+            self.block_size,
+            self.hash_block_size,
+            self.fa_gidx,
+            self.fa_block_size,
+            num_cached_fa_blocks,
+            num_computed_tokens,
+            num_external_tokens,
+            total_computed_tokens,
+            [len(ids) for ids in block_ids_by_group],
+            [len(group) for group in cpu_hit_blocks_full],
+        )
+
         # The scheduler may have accepted fewer blocks than
         # get_num_new_matched_tokens() reported.
         # (e.g. due to token budget in test_partial_gpu_prefix_plus_cpu_load).
@@ -351,14 +399,13 @@ class SimpleCPUOffloadScheduler:
         # the rest will be released along with the temp pin below.
         cpu_hit_blocks: list[list[KVCacheBlock]] = []
         for g in range(num_groups):
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
-            )
-            assert num_external_tokens % g_block_size == 0, (
+            spec = kv_cache_groups[g].kv_cache_spec
+            g_token_block_size = self._get_group_token_block_size(spec)
+            assert num_external_tokens % g_token_block_size == 0, (
                 f"num_external_tokens={num_external_tokens} not aligned to "
-                f"group {g} effective block_size={g_block_size}"
+                f"group {g} token_block_size={g_token_block_size}"
             )
-            n_take_g = num_external_tokens // g_block_size
+            n_take_g = num_external_tokens // g_token_block_size
             cpu_hit_blocks.append(cpu_hit_blocks_full[g][:n_take_g])
 
         gpu_block_ids: list[int] = []
@@ -372,14 +419,49 @@ class SimpleCPUOffloadScheduler:
                 continue
 
             # Number of blocks in the computed range for this group.
-            g_block_size = (
-                kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
-            )
-            n_computed_g = cdiv(total_computed_tokens, g_block_size)
+            spec = kv_cache_groups[g].kv_cache_spec
+            g_physical_block_size = spec.block_size * self.cp_world_size
+            g_token_block_size = self._get_group_token_block_size(spec)
+            n_computed_g = cdiv(total_computed_tokens, g_token_block_size)
 
             # Back-trace: ext blocks sit at the tail of the computed range.
             gpu_ext_start = n_computed_g - n_ext_g
             group_gpu_ids = block_ids_by_group[g]
+
+            logger.debug(
+                "SimpleCPUOffloadScheduler group load mapping: req_id=%s "
+                "group=%d spec=%s physical_block_size=%d "
+                "token_block_size=%d compress_ratio=%s "
+                "group_gpu_ids_len=%d cpu_hit_full_len=%d n_ext_g=%d "
+                "n_computed_g=%d gpu_ext_start=%d gpu_ext_end=%d "
+                "cpu_null_blocks=%d",
+                req_id,
+                g,
+                type(spec).__name__,
+                g_physical_block_size,
+                g_token_block_size,
+                getattr(spec, "compress_ratio", 1),
+                len(group_gpu_ids),
+                len(cpu_hit_blocks_full[g]),
+                n_ext_g,
+                n_computed_g,
+                gpu_ext_start,
+                gpu_ext_start + n_ext_g,
+                sum(block.is_null for block in cpu_blocks_g),
+            )
+
+            if gpu_ext_start < 0 or gpu_ext_start + n_ext_g > len(group_gpu_ids):
+                self._free_pending_cpu_hit(pending)
+                raise RuntimeError(
+                    "SimpleCPUOffloadScheduler produced an invalid external "
+                    f"KV block mapping for req_id={req_id}, group={g}, "
+                    f"spec={type(spec).__name__}: gpu_blocks="
+                    f"{len(group_gpu_ids)}, external_blocks={n_ext_g}, "
+                    f"computed_blocks={n_computed_g}, start={gpu_ext_start}, "
+                    f"token_block_size={g_token_block_size}, "
+                    f"num_computed_tokens={num_computed_tokens}, "
+                    f"num_external_tokens={num_external_tokens}"
+                )
 
             for i, cpu_blk in enumerate(cpu_blocks_g):
                 # Skip null blocks (e.g. sliding window or mamba padding).
@@ -604,10 +686,10 @@ class SimpleCPUOffloadScheduler:
                 already_stored_g = state.num_stored_blocks[g]
                 group_gpu_ids = block_ids_by_group[g]
 
-                g_block_size = (
-                    kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
+                g_token_block_size = self._get_group_token_block_size(
+                    kv_cache_groups[g].kv_cache_spec
                 )
-                ready_blocks_g = aligned_tokens // g_block_size
+                ready_blocks_g = aligned_tokens // g_token_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for gpu_block_id in scannable:

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -39,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MLAAttentionSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -1839,3 +1842,116 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 19: DeepSeek-V4 compressed MLA uses logical token block size
+# ---------------------------------------------------------------------------
+def _make_deepseek_v4_compressed_scheduler() -> tuple[
+    SchedulerFixture, MLAAttentionSpec
+]:
+    num_gpu_blocks = 16
+    num_cpu_blocks = 8
+    spec = MLAAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    layer_names = ["compressed_mla"]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_gpu_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_gpu_blocks,
+                shared_by=layer_names,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names, spec)],
+    )
+    # This scheduler test only needs max_model_len; avoid loading a remote
+    # Hugging Face model config so the regression remains fully offline.
+    cfg = VllmConfig(device_config=DeviceConfig("cpu"))
+    cfg.model_config = cast(ModelConfig, SimpleNamespace(max_model_len=10000))
+    cfg.scheduler_config.max_num_batched_tokens = 64
+    sched = SimpleCPUOffloadScheduler(
+        vllm_config=cfg,
+        kv_cache_config=kv_cache_config,
+        cpu_capacity_bytes=spec.page_size_bytes * num_cpu_blocks,
+        scheduler_block_size=BLOCK_SIZE,
+        hash_block_size=BLOCK_SIZE,
+        lazy_offload=False,
+    )
+    gpu_pool = BlockPool(
+        num_gpu_blocks=num_gpu_blocks,
+        enable_caching=True,
+        hash_block_size=BLOCK_SIZE,
+    )
+    sched.bind_gpu_block_pool(gpu_pool)
+    return (
+        SchedulerFixture(sched, gpu_pool, cfg, kv_cache_config),
+        spec,
+    )
+
+
+def test_deepseek_v4_compressed_mla_load_mapping() -> None:
+    """Compressed MLA blocks represent ``block_size * compress_ratio`` tokens.
+
+    Reproduce the production failure with a smaller ratio-4 cache:
+    one locally cached physical block represents 64 model tokens, followed by
+    one externally cached block.  The pending hit deliberately contains two
+    blocks to also verify that an accepted 64-token suffix is cropped to one
+    compressed block.
+
+    The old mapping treated every physical block as 16 model tokens, derived
+    ``gpu_ext_start=4`` for a two-block GPU table, and raised IndexError.
+    """
+    fix, spec = _make_deepseek_v4_compressed_scheduler()
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    req = make_request(num_blocks=8, request_id="req-dsv4-compressed-load")
+    gpu_local = _allocate_gpu_blocks(gpu_pool, req, 1, group_id=0)
+    gpu_external = gpu_pool.get_new_blocks(1)
+    kv_blocks = KVCacheBlocks(blocks=(gpu_local + gpu_external,))
+
+    # Phase A normally pins all blocks returned by the CPU cache lookup.  Use
+    # two here to model a longer available hit while Phase B accepts one block.
+    cpu_hit_blocks = sched.cpu_block_pool.get_new_blocks(2)
+    sched._pending_cpu_hits[req.request_id] = ((cpu_hit_blocks,), 128)
+
+    logical_block_size = BLOCK_SIZE * spec.compress_ratio
+    assert sched.fa_block_size == logical_block_size
+    sched.update_state_after_alloc(
+        req,
+        kv_blocks,
+        num_external_tokens=logical_block_size,
+    )
+
+    transfer = sched._reqs_to_load[req.request_id].transfer_meta
+    assert transfer.gpu_block_ids == [gpu_external[0].block_id]
+    assert transfer.cpu_block_ids == [cpu_hit_blocks[0].block_id]
+
+
+def test_deepseek_v4_compressed_mla_store_only_confirmed_blocks() -> None:
+    """Eager offload must not store an uncomputed compressed MLA block."""
+    fix, spec = _make_deepseek_v4_compressed_scheduler()
+    sched = fix.scheduler
+
+    req = make_request(num_blocks=8, request_id="req-dsv4-compressed-store")
+    gpu_blocks = _allocate_gpu_blocks(fix.gpu_block_pool, req, 2, group_id=0)
+    kv_blocks = KVCacheBlocks(blocks=(gpu_blocks,))
+    logical_block_size = BLOCK_SIZE * spec.compress_ratio
+    req.num_computed_tokens = logical_block_size
+    sched.update_state_after_alloc(req, kv_blocks, num_external_tokens=0)
+
+    metadata = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: logical_block_size},
+            new_reqs={req.request_id: kv_blocks.get_block_ids()},
+        )
+    )
+    assert metadata.store_gpu_blocks == [gpu_blocks[0].block_id]
+    assert len(metadata.store_cpu_blocks) == 1
