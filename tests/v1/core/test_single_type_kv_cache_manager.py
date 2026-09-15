@@ -14,16 +14,58 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     RSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("external_blocks", [0, 1, 3, 4])
+def test_external_computed_blocks_do_not_corrupt_free_pool(external_blocks):
+    block_size = 4
+    pool = BlockPool(10, enable_caching=False, hash_block_size=block_size)
+    manager = FullAttentionManager(
+        FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    request_id = "external-allocation"
+    manager.allocate_new_blocks(request_id, 3 * block_size, 3 * block_size)
+
+    # A request may already hold speculative or cached blocks beyond the
+    # eventual external computed-token count.
+    manager.allocate_external_computed_blocks(
+        request_id,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=external_blocks * block_size,
+    )
+
+    assert len(manager.req_to_blocks[request_id]) == max(3, external_blocks)
+    assert pool.get_num_free_blocks() == 9 - max(3, external_blocks)
+    assert (
+        len(pool.free_block_queue.get_all_free_blocks()) == pool.get_num_free_blocks()
+    )
+    remaining = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert all(not block.is_null for block in remaining)
+    pool.free_blocks(remaining)
+    manager.free(request_id)
+    assert pool.get_num_free_blocks() == 9
+    assert len(pool.free_block_queue.get_all_free_blocks()) == 9
 
 
 def get_sliding_window_manager(sliding_window_spec, block_pool, enable_caching=True):

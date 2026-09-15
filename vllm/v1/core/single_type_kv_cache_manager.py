@@ -264,9 +264,10 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         req_blocks = self.req_to_blocks[request_id]
-        allocated_blocks = self.block_pool.get_new_blocks(
-            cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+        num_new_blocks = max(
+            0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
+        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
         req_blocks.extend(allocated_blocks)
         if type(self.kv_cache_spec) in (
             FullAttentionSpec,
