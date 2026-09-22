@@ -25,6 +25,7 @@ from vllm.entrypoints.serve.utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RepetitionDetectionParams
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -36,7 +37,7 @@ def _parse_repetition_detection_config(value: str) -> RepetitionDetectionParams:
         if not isinstance(config, dict):
             raise TypeError("expected a JSON object")
         return RepetitionDetectionParams(**config)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (json.JSONDecodeError, TypeError, ValueError, VLLMValidationError) as exc:
         raise argparse.ArgumentTypeError(
             f"invalid repetition detection config: {exc}"
         ) from exc
