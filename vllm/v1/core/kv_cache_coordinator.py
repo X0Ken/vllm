@@ -119,6 +119,13 @@ class KVCacheCoordinator(ABC):
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
 
+        # EAGLE can move the common hit back by one aligned boundary. All
+        # windowed groups must restore enough history to support that boundary.
+        for manager in self.single_type_managers:
+            manager.external_prefix_rewind_tokens = (
+                self.scheduler_block_size if self.eagle_group_ids else 0
+            )
+
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;

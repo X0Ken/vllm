@@ -33,6 +33,13 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 
+def sliding_window_restore_start(
+    num_tokens: int, sliding_window: int, rewind_tokens: int = 0
+) -> int:
+    """First token needed to restore a window and its replay history."""
+    return max(0, num_tokens - sliding_window + 1 - rewind_tokens)
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -110,6 +117,7 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        self.external_prefix_rewind_tokens = 0
 
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
@@ -140,6 +148,12 @@ class SingleTypeKVCacheManager(ABC):
             len(new_computed_blocks) > 0
             and num_local_computed_tokens % self.block_size != 0
         )
+
+    def get_num_skipped_tokens_for_external(
+        self, num_computed_tokens: int, num_external_computed_tokens: int
+    ) -> int:
+        """Return the allocation skip while adopting external computed tokens."""
+        return self.get_num_skipped_tokens(num_computed_tokens)
 
     def get_num_blocks_to_allocate(
         self,
@@ -199,7 +213,9 @@ class SingleTypeKVCacheManager(ABC):
             # num_required_blocks may be smaller than num_req_blocks.
             return max(num_required_blocks - num_req_blocks, 0)
 
-        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
+            total_computed_tokens, total_computed_tokens - num_local_computed_tokens
+        )
         num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks
         # Number of whole blocks that are skipped by the attention window.
         # If nothing is skipped, this is 0.
@@ -257,7 +273,9 @@ class SingleTypeKVCacheManager(ABC):
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
         )
-        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
+        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
+            num_total_computed_tokens, num_external_computed_tokens
+        )
         num_skipped_blocks = num_skipped_tokens // self.block_size
         if num_skipped_blocks > 0:
             # It is possible that all new computed blocks are skipped when
@@ -309,7 +327,9 @@ class SingleTypeKVCacheManager(ABC):
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
         )
-        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)
+        num_skipped_tokens = self.get_num_skipped_tokens_for_external(
+            num_total_computed_tokens, num_external_computed_tokens
+        )
         if num_skipped_tokens > 0:
             # Some external computed tokens may be skipped too.
             num_external_computed_tokens = min(
@@ -455,6 +475,12 @@ class SingleTypeKVCacheManager(ABC):
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
+        restore_kwargs = {}
+        if isinstance(self.kv_cache_spec, SlidingWindowSpec):
+            restore_kwargs["external_prefix_rewind_tokens"] = max(
+                self.external_prefix_rewind_tokens,
+                self.block_size if self.use_eagle else 0,
+            )
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
             end_block=num_full_blocks,
@@ -463,6 +489,7 @@ class SingleTypeKVCacheManager(ABC):
             use_eagle=self.use_eagle,
             retention_interval=retention_interval,
             reachable_boundaries=reachable_boundaries,
+            **restore_kwargs,
         )
         self.block_pool.cache_full_blocks(
             request=request,
@@ -1002,6 +1029,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         use_eagle: bool,
         retention_interval: int | None = None,
         reachable_boundaries: Sequence[int] = (),
+        external_prefix_rewind_tokens: int = 0,
     ) -> list[bool] | None:
         assert isinstance(kv_cache_spec, SlidingWindowSpec)
         if alignment_tokens is None:
@@ -1052,7 +1080,46 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 for j in range(max(start_block, end - need), min(end_block, end)):
                     mask[j - start_block] = True
 
+        # Keep the same restore window used by allocation and external loading.
+        # Existing tails above also preserve the EAGLE proof block.
+        if external_prefix_rewind_tokens:
+            restore_boundaries = set(reachable_boundaries)
+            if segment_tokens is not None:
+                first = cdiv(start_block * block_size, segment_tokens)
+                last = end_block * block_size // segment_tokens
+                restore_boundaries.update(
+                    n * segment_tokens for n in range(max(1, first), last + 1)
+                )
+            for boundary in restore_boundaries:
+                boundary = boundary // alignment_tokens * alignment_tokens
+                first_block = (
+                    sliding_window_restore_start(
+                        boundary,
+                        kv_cache_spec.sliding_window,
+                        external_prefix_rewind_tokens,
+                    )
+                    // block_size
+                )
+                last_block = boundary // block_size
+                for j in range(
+                    max(start_block, first_block), min(end_block, last_block)
+                ):
+                    mask[j - start_block] = True
         return mask
+
+    def get_num_skipped_tokens_for_external(
+        self, num_computed_tokens: int, num_external_computed_tokens: int
+    ) -> int:
+        if num_external_computed_tokens <= 0:
+            return self.get_num_skipped_tokens(num_computed_tokens)
+        return sliding_window_restore_start(
+            num_computed_tokens,
+            self.sliding_window,
+            max(
+                self.external_prefix_rewind_tokens,
+                self.block_size if self.use_eagle else 0,
+            ),
+        )
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
