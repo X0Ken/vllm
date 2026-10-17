@@ -1035,3 +1035,28 @@ def test_swa_missing_latest_checkpoint_falls_back_to_older_window():
     )
     assert hit == 8 * block_size
     assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+
+
+@pytest.mark.parametrize("extra_retained", [0, 128, 512])
+@pytest.mark.parametrize("external", [0, 128, 1024])
+def test_external_restore_preserves_multi_module_replay_history(
+    extra_retained, external
+):
+    """Adoption must not free history already required by the 0.31 MTP runner."""
+    spec = SlidingWindowSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=256,
+    )
+    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=128)
+    manager = get_sliding_window_manager(spec, pool)
+    manager.extra_retained_tokens = extra_retained
+    manager.external_prefix_rewind_tokens = 128
+    actual = manager.get_num_skipped_tokens_for_external(1280, external)
+    if external == 0:
+        assert actual == manager.get_num_skipped_tokens(1280)
+    else:
+        assert actual == max(0, 1280 - 256 + 1 - max(extra_retained, 128))
+        assert actual <= manager.get_num_skipped_tokens(1280)
