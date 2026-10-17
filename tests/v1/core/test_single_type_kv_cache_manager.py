@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -914,3 +915,123 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+@pytest.mark.parametrize("window", [128, 256])
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("common_rewind", [0, 128])
+@pytest.mark.parametrize("retention", [None, 0, 256])
+def test_external_swa_restore_remains_reusable(
+    window, use_eagle, common_rewind, retention
+):
+    """External adoption must restore the full next-lookup window, without leaks."""
+    block_size = 128
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=window,
+    )
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=block_size)
+    manager = get_sliding_window_manager(spec, pool)
+    manager.use_eagle = use_eagle
+    manager.external_prefix_rewind_tokens = common_rewind
+    restored_tokens = 10 * block_size
+    prompt_tokens = restored_tokens + 17
+    request = SimpleNamespace(
+        request_id="restore",
+        num_prompt_tokens=prompt_tokens,
+        shared_prefix_boundary=None,
+        block_hashes=[BlockHash(str(i).encode()) for i in range(12)],
+    )
+    predicted = manager.get_num_blocks_to_allocate(
+        request.request_id, prompt_tokens, [], restored_tokens, 0, prompt_tokens
+    )
+    free_before = pool.get_num_free_blocks()
+    manager.add_local_computed_blocks(request.request_id, [], 0, restored_tokens)
+    manager.allocate_external_computed_blocks(request.request_id, 0, restored_tokens)
+    manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
+    assert free_before - pool.get_num_free_blocks() == predicted
+    manager.cache_blocks(request, restored_tokens, retention_interval=retention)
+    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
+    expected = restored_tokens - (block_size if use_eagle else 0)
+    for max_length in (prompt_tokens - 1, prompt_tokens + 2 * block_size):
+        _, hit = manager.find_longest_cache_hit(
+            request.block_hashes, max_length, [0], pool, spec, use_eagle, block_size
+        )
+        assert hit == expected
+    if common_rewind and not use_eagle:
+        # Target SWA must also serve the boundary selected by its draft sibling.
+        _, rewind_hit = manager.find_longest_cache_hit(
+            request.block_hashes,
+            restored_tokens - common_rewind,
+            [0],
+            pool,
+            spec,
+            False,
+            block_size,
+        )
+        assert rewind_hit == restored_tokens - common_rewind
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+    computed, hit = manager.find_longest_cache_hit(
+        request.block_hashes,
+        prompt_tokens - 1,
+        [0],
+        pool,
+        spec,
+        use_eagle,
+        block_size,
+    )
+    request.request_id = "mixed-local-external"
+    predicted = manager.get_num_blocks_to_allocate(
+        request.request_id,
+        prompt_tokens,
+        computed[0],
+        restored_tokens,
+        hit,
+        prompt_tokens,
+    )
+    free_before = pool.get_num_free_blocks()
+    manager.add_local_computed_blocks(
+        request.request_id, computed[0], hit, restored_tokens - hit
+    )
+    manager.allocate_external_computed_blocks(
+        request.request_id, hit, restored_tokens - hit
+    )
+    manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
+    assert free_before - pool.get_num_free_blocks() == predicted
+    manager.cache_blocks(request, restored_tokens, retention_interval=retention)
+    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+
+
+def test_swa_missing_latest_checkpoint_falls_back_to_older_window():
+    """A missing tail must not discard a complete older EAGLE checkpoint."""
+    block_size = 128
+    spec = SlidingWindowSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=block_size)
+    manager = get_sliding_window_manager(spec, pool)
+    manager.use_eagle = True
+    request = SimpleNamespace(
+        request_id="cold",
+        num_prompt_tokens=1297,
+        shared_prefix_boundary=None,
+        block_hashes=[BlockHash(str(i).encode()) for i in range(12)],
+    )
+    manager.allocate_new_blocks(request.request_id, 1297, 1297)
+    manager.cache_blocks(request, 1280)
+    latest = manager.req_to_blocks[request.request_id][9].block_id
+    pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
+    pool.evict_blocks({latest})
+    _, hit = manager.find_longest_cache_hit(
+        request.block_hashes, 1296, [0], pool, spec, True, block_size
+    )
+    assert hit == 8 * block_size
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
