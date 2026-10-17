@@ -953,7 +953,12 @@ def test_external_swa_restore_remains_reusable(
     manager.allocate_external_computed_blocks(request.request_id, 0, restored_tokens)
     manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
     assert free_before - pool.get_num_free_blocks() == predicted
-    manager.cache_blocks(request, restored_tokens, retention_interval=retention)
+    manager.cache_blocks(
+        request,
+        restored_tokens,
+        retention_interval=retention,
+        replay_boundaries=[prompt_tokens - 1],
+    )
     pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
     expected = restored_tokens - (block_size if use_eagle else 0)
     for max_length in (prompt_tokens - 1, prompt_tokens + 2 * block_size):
@@ -1001,7 +1006,12 @@ def test_external_swa_restore_remains_reusable(
     )
     manager.allocate_new_blocks(request.request_id, prompt_tokens, prompt_tokens)
     assert free_before - pool.get_num_free_blocks() == predicted
-    manager.cache_blocks(request, restored_tokens, retention_interval=retention)
+    manager.cache_blocks(
+        request,
+        restored_tokens,
+        retention_interval=retention,
+        replay_boundaries=[prompt_tokens - 1],
+    )
     pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
     assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
 
@@ -1026,7 +1036,9 @@ def test_swa_missing_latest_checkpoint_falls_back_to_older_window():
         block_hashes=[BlockHash(str(i).encode()) for i in range(12)],
     )
     manager.allocate_new_blocks(request.request_id, 1297, 1297)
-    manager.cache_blocks(request, 1280)
+    manager.cache_blocks(
+        request, 1280, replay_boundaries=[request.num_prompt_tokens - 1]
+    )
     latest = manager.req_to_blocks[request.request_id][9].block_id
     pool.free_blocks(manager.pop_blocks_for_free(request.request_id))
     pool.evict_blocks({latest})
