@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -16,12 +19,64 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
 )
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 
 __all__ = [
     "AiterW4A16ExpertsMonolithic",
     "aiter_triton_kernel_w4a16_moe_forward",
 ]
+
+
+@triton.jit
+def _compact_local_blocks(
+    blocks_ptr,
+    expert_map_ptr,
+    output_ptr,
+    count_ptr,
+    num_blocks: tl.constexpr,
+    capacity: tl.constexpr,
+    tile: tl.constexpr,
+):
+    i = tl.arange(0, tile)
+    block = tl.load(blocks_ptr + i, i < num_blocks, other=-1)
+    valid = (i < num_blocks) & (block >= 0)
+    local = tl.load(expert_map_ptr + (block & 0xFFFF), valid, other=-1) >= 0
+    keep = valid & local
+    index = tl.cumsum(keep.to(tl.int32))
+    count = tl.sum(keep.to(tl.int32))
+    tl.store(output_ptr + index - 1, block, keep & (index <= capacity))
+    tl.store(output_ptr + i, -1, (i >= count) & (i < capacity))
+    tl.store(count_ptr, count)
+
+
+def _compact_routing(routing_data, expert_map, local_experts, gate_count):
+    """Give both gfx942 GEMMs a local grid while retaining global token offsets."""
+    expert_data = routing_data.expt_data
+    blocks = expert_data.block_pid_map
+    # One initial block per local expert, then a full block of assignments
+    # for each additional block.
+    capacity = min(
+        blocks.numel(), local_experts + triton.cdiv(gate_count, routing_data.block_m)
+    )
+    output = torch.empty((capacity,), dtype=torch.int32, device=blocks.device)
+    count = torch.empty((1,), dtype=torch.int32, device=blocks.device)
+    _compact_local_blocks[(1,)](
+        blocks,
+        expert_map,
+        output,
+        count,
+        blocks.numel(),
+        capacity,
+        triton.next_power_of_2(blocks.numel()),
+    )
+    # This AITER wrapper reads token_offs_pad[-1] to bound the swizzled grid.
+    # It uses token_offs_raw for global gather/scatter offsets.
+    compact = replace(
+        routing_data,
+        expt_data=replace(expert_data, block_pid_map=output, token_offs_pad=count),
+    )
+    compact.n_blocks = lambda *_: capacity
+    return compact
 
 
 def _aiter_w4a16_silu_via_a8w4(
@@ -142,7 +197,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
     )
-    from vllm.platforms.rocm import on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import on_gfx942, on_gfx950, on_gfx1250
 
     try:
         from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
@@ -212,6 +267,19 @@ def aiter_triton_kernel_w4a16_moe_forward(
             "expert-parallel W4A16 requires aiter routing to expose topk_ids"
         )
         gate_valid = (expert_map[topk_ids.long()] >= 0).to(torch.int32).contiguous()
+
+    if (
+        envs.VLLM_ROCM_MI308X_COMPACT_MOE
+        and on_gfx942()
+        and expert_map is not None
+        and hidden_states.shape[0] in (80, 96)
+    ):
+        routing_data = _compact_routing(
+            routing_data,
+            expert_map,
+            w1.storage.data.shape[0],
+            hidden_states.shape[0] * topk,
+        )
 
     assert quant_config.w1_precision is not None
     assert quant_config.w2_precision is not None

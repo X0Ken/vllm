@@ -146,6 +146,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_MI308X_COMPACT_MOE: bool = False
     VLLM_FP8_MOE_REQUANT: Literal["none", "mxfp4"] = "none"
     VLLM_FP8_MOE_REQUANT_ACT: Literal["a8w4", "a4w4", "a16w4"] = "a8w4"
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
@@ -1383,6 +1384,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "a8w4",
         ["a8w4", "a4w4", "a16w4"],
         case_sensitive=False,
+    ),
+    # Compact gfx942 W4A16 expert blocks for the tested small decode shapes.
+    "VLLM_ROCM_MI308X_COMPACT_MOE": lambda: (
+        os.getenv("VLLM_ROCM_MI308X_COMPACT_MOE", "0").lower() in ("1", "true")
     ),
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
