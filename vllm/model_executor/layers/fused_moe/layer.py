@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import re
 from collections.abc import Callable
+from functools import cache
+from pathlib import Path
 from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -42,6 +47,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -89,6 +95,43 @@ def determine_expert_counts(
     )
 
     return global_num_experts, logical_num_experts, num_fused_shared_experts
+
+
+@cache
+def _load_mi308x_expert_layout(path: str) -> dict[str, list[list[int]]]:
+    with Path(path).open(encoding="utf-8") as layout_file:
+        layout = json.load(layout_file)
+    if not isinstance(layout, dict):
+        raise ValueError(f"Expected layer IDs as keys in MI308X layout {path}")
+    return layout
+
+
+def _apply_mi308x_expert_layout(
+    path: str, layer_id: str, expert_map_manager: ExpertMapManager, ep_rank: int
+) -> None:
+    owners = _load_mi308x_expert_layout(path).get(layer_id)
+    if (
+        not isinstance(owners, list)
+        or len(owners) != 8
+        or any(not isinstance(group, list) or len(group) != 48 for group in owners)
+        or any(type(expert) is not int for group in owners for expert in group)
+        or sorted(expert for group in owners for expert in group) != list(range(384))
+    ):
+        raise ValueError(
+            f"Invalid MI308X expert layout for layer {layer_id} in {path}: "
+            "expected each of the 384 expert IDs exactly once across 8 ranks"
+        )
+
+    mapping = expert_map_manager.expert_map
+    assert mapping is not None
+    local_experts = owners[ep_rank]
+    mapping[:384].fill_(-1)
+    mapping[local_experts] = torch.arange(
+        len(local_experts), dtype=mapping.dtype, device=mapping.device
+    )
+    mask = expert_map_manager.expert_mask
+    if mask is not None:
+        mask[:384].copy_(mapping[:384] >= 0)
 
 
 def FusedMoEFactory(
@@ -308,6 +351,31 @@ def FusedMoEFactory(
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
     )
+
+    layout_path = envs.VLLM_ROCM_MI308X_EXPERT_LAYOUT
+    if (
+        layout_path
+        and global_num_experts == 384
+        and moe_parallel_config.ep_size == 8
+        and scoring_func == "sqrtsoftplus"
+        and current_platform.is_rocm()
+    ):
+        from vllm.platforms.rocm import on_gfx942
+
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)\.ffn\.experts$", prefix)
+        if layer_match and on_gfx942():
+            if eplb_state is not None or moe_parallel_config.use_all2all_kernels:
+                raise ValueError(
+                    "MI308X static expert layout requires EPLB and "
+                    "all-to-all kernels to be disabled"
+                )
+            # Update local expert ownership before allocating or loading weights.
+            _apply_mi308x_expert_layout(
+                layout_path,
+                layer_match[1],
+                expert_map_manager,
+                moe_parallel_config.ep_rank,
+            )
 
     # TODO(bnell): we should not have to create a router if the kernel is
     # monolithic.
